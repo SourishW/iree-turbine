@@ -1005,6 +1005,7 @@ def handle_conditional(emitter: WaveEmitter, node: fx.Node):
 
 @handle_op(iterate)
 def handle_iterate(emitter: WaveEmitter, node: fx.Node):
+    print("iterate called")
     try:
         axis, init_args, subgraph, implicit_capture, step, start, condition = node.args
     except ValueError as e:
@@ -1045,6 +1046,7 @@ def handle_iterate(emitter: WaveEmitter, node: fx.Node):
     emitter.induction_vars[axis] = forOp.induction_variable
     with InsertionPoint(forOp.body):
         # Add mapping for iter args.
+        emitter.trace.get_root_graph
         subgraph: fx.Graph = emitter.trace.get_subgraph(subgraph)
         iter_args: list[fx.Node] = get_custom(node).iter_args(subgraph)
         assert len(iter_args) == len(forOp.inner_iter_args), (

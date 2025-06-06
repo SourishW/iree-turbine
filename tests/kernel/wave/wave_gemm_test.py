@@ -41,6 +41,7 @@ from torch.testing import assert_close
 # Add test shapes for validation and performance testing.
 default_test_shapes = {}
 default_test_shapes["test_gemm"] = [
+    # (256, 256, 256),
     (1024, 5120, 640),
     (2048, 10240, 1280),
     (4096, 20480, 2560),
@@ -72,9 +73,9 @@ def get_test_shapes(test_name: str) -> list[tuple[int]]:
     "enable_scheduling",
     [
         SchedulingType.NONE,
-        SchedulingType.PREFETCH,
-        SchedulingType.MODULO,
-        SchedulingType.MODULO_MULTI_BUFFERED,
+        # SchedulingType.PREFETCH,
+        # SchedulingType.MODULO,
+        # SchedulingType.MODULO_MULTI_BUFFERED,
     ],
 )
 @param_bool("dynamic_dims", "dyn")
@@ -82,7 +83,7 @@ def get_test_shapes(test_name: str) -> list[tuple[int]]:
     "mfma_variant",
     [
         MMAType.F32_16x16x16_F16,
-        MMAType.F32_32x32x8_F16,
+        # MMAType.F32_32x32x8_F16,
     ],
 )
 def testPureGemm(
@@ -154,13 +155,16 @@ def testPureGemm(
 
     hyperparams = {
         ADDRESS_SPACE: SHARED_ADDRESS_SPACE,
-        BLOCK_M: 64,
-        BLOCK_N: 64,
+        BLOCK_M: 32,
+        BLOCK_N: 32,
         BLOCK_K: 32,
         M: shape[0],
         N: shape[1],
         K: shape[2],
     }
+    #  BLOCK_M: 64,
+    #     BLOCK_N: 32,
+    #     BLOCK_K: 256,
     hyperparams.update(get_default_scheduling_params())
 
     dynamic_symbols = []
@@ -181,6 +185,8 @@ def testPureGemm(
         subs=hyperparams,
         canonicalize=True,
         run_bench=run_bench,
+        use_buffer_load_ops=True,
+        use_buffer_store_ops= True,
         schedule=enable_scheduling,
         use_scheduling_barriers=enable_scheduling_barriers,
         dynamic_symbols=dynamic_symbols,

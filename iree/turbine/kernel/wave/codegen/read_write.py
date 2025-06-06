@@ -398,26 +398,189 @@ def _get_splat_input(src: Optional[Value]) -> Optional[Value]:
 
     return None
 
+import re
+from sympy import symbols, floor, ceiling, Mod, Max, Min, sympify
+
+def mlir_affine_to_sympy(expr_str: str):
+    """
+    Converts an MLIR affine expression string to a SymPy expression string and evaluates it.
+    Supported operators: +, -, *, floordiv, ceildiv, mod, max, min
+    """
+
+    def replace_op(expr, op, replacement):
+        return expr.replace(op, replacement)
+
+    # Apply replacements for floordiv, ceildiv, mod, max, min
+    expr_str = replace_op(expr_str, 'floordiv', '//')
+    expr_str = replace_op(expr_str, 'ceildiv', '//')
+    expr_str = replace_op(expr_str, 'mod', '%')
+    expr_str = replace_op(expr_str, 'max', '+')
+    expr_str = replace_op(expr_str, 'min', '+')
+    # Return both parsed string and SymPy object
+    sympy_expr = sympify(expr_str)
+    return sympy_expr
+
+from sympy import diff
+
+def differentiate_affine(expr, var_name: str):
+    """
+    Takes the derivative of a SymPy expression with respect to a variable by name.
+    """
+    var = symbols(var_name)
+    return diff(expr, var)
+
+def _identify_loop_body(offset: OpResult) -> Optional[Value]:
+    """
+    returns whether the operation is contained within an affine or scf for loop
+    """ 
+    offset = offset.owner
+    cur_node = offset
+    while cur_node.name not in ['scf.for', 'affine.for', 'func.func']:
+        cur_node = cur_node.parent
+        
+      
+    if cur_node.name == "func.func":
+        return None
+    
+    return cur_node.result
+
+def _infer_stride_from_offset(offset_component: OpResult, loopbody: Optional[Value] = None) -> Optional[Value]:
+    """
+    Takes an offset variable and traces it to find the stride in the innermost iteration block, if it can. It finds this by ignoring the loop invariant operations in the graph and tracing affine maps and other things as a function of the loop induction variable. If it can't find the stride or a stride doesn't exist, returns None
+    """
+    
+    # recursive algorithm to trace the computation graph
+    if loopbody is None:
+        # find offset's parent loop
+        loopbody = _identify_loop_body(offset_component)
+
+    # breakpoint()
+    # check if the component is loop-invariant 
+    if loopbody is None or offset_component.owner.parent.result != loopbody: 
+        return None
+    
+    induction_variable = loopbody.owner.opview.induction_variable
+    induction_variable_name = induction_variable.get_name()
+    
+    def find_non_None(items):
+        for item in items:
+            if item is not None:
+                return item
+    
+    def any_none(items):
+        return any(x is None for x in items)
+
+    operation_name = offset_component.owner.name
+    operation_operands = offset_component.owner.operands
+    # breakpoint()
+    
+    print(offset_component.owner.get_asm())
+    match offset_component.owner.name:
+        case "arith.constant": 
+            return arith_d.constant(offset_component.type, 0)
+        
+
+        case "arith.index_cast":
+            the_stride = _infer_stride_from_offset(operation_operands[0].owner.result)
+            return arith_d.index_cast(IntegerType.get_signless(32), the_stride)
+        
+        case "arith.addi":
+            left_stride = _infer_stride_from_offset(operation_operands[0].owner.result)
+            right_stride = _infer_stride_from_offset(operation_operands[1].owner.result)
+            both = [left_stride, right_stride]
+            return arith_d.addi(left_stride, right_stride) if not any_none(both) else find_non_None(both) 
+        
+        case "arith.muli":
+            
+            left_stride = _infer_stride_from_offset(operation_operands[0].owner.result)
+            right_stride = _infer_stride_from_offset(operation_operands[1].owner.result)
+
+            # this is essentially product rule :) if you consider finding stride to be the first derivative with respect to the induction variable
+            # derivative of first times second + derivative of second times first 
+            lhs = arith_d.muli(left_stride, operation_operands[1].owner.result) if left_stride is not None else None
+            rhs = arith_d.muli(operation_operands[0].owner.result, right_stride) if right_stride is not None else None
+            both = [lhs, rhs]
+            return arith_d.addi(lhs, rhs) if  not any_none(both) else find_non_None(both)
+        
+           
+        case "affine.apply":
+            affine_apply_op = offset_component.owner.opview
+            map = affine_apply_op.map
+            map = map.value
+            if len(map.results) > 1:
+                return None
+            affine_expr = map.results[0]
+            str_affine = str(affine_expr)
+            sympyed = mlir_affine_to_sympy(str_affine)
+
+            important = list()
+            sym_to_op = dict()
+
+            # need to determine which of the operands are actually important
+            for i, operand in enumerate(operation_operands):
+                if operand.get_name() == induction_variable_name:
+                    important.append("s"+str(i))
+                sym_to_op["s"+str(i)] = operand
+            # only one of these should really be important
+            
+            if len(important) == 0:
+                # breakpoint()
+                return None
+            important = important[0]
+            derivative_wrt_induction = differentiate_affine(sympyed, important )
+            ans = sym_to_op[str(derivative_wrt_induction)]
+            return ans.owner.result
+
+        case _:
+            raise ValueError("Unhandled Case for Something Idk")
+    return None
 
 def _create_buffer_read_write(
     elem_type: IrType, ptr: Value, offset: Value, value: Optional[Value] = None
 ) -> Optional[Value]:
     # Buffer ops doesn't support 1-element vectors, convert to scalar.
     is_1elem = isinstance(elem_type, VectorType) and elem_type.shape == [1]
+
+    stride = _infer_stride_from_offset(offset)
+    # stride = None
+    if stride is not None:
+        
+        stride = arith_d.trunci(IntegerType.get_signless(14),stride)
+        ptr = amdgpu_d.fat_raw_buffer_cast(ptr, cache_swizzle_stride=stride, bounds_check=False, reset_offset=False)
+        offset = arith_d.index_cast(IndexType.get(), offset)
+
+
     if value is None:
         load_type = elem_type
         if is_1elem:
             load_type = elem_type.element_type
-
-        res = amdgpu_d.raw_buffer_load(load_type, ptr, indices=[offset])
+        
+            # pass
+        # breakpoint()
+        
+        if stride is not None:
+            res = vector_d.load(elem_type, ptr, indices=[offset])
+        
+        else:
+        # res = vector_d.load(vector_type, mem, start_indices)
+            # amdgpu_d.raw_buffer_load()
+            res = amdgpu_d.raw_buffer_load(load_type, ptr, indices=[offset])
+        
         if is_1elem:
             res = vector_d.splat(elem_type, res)
+
+       
 
         return res
     else:
         if is_1elem:
             value = vector_d.extract(value, static_position=[0], dynamic_position=[])
-        amdgpu_d.raw_buffer_store(value, ptr, indices=[offset])
+        if stride is not None:
+            res = vector_d.store(value, ptr, indices= [offset])
+
+        else:
+            amdgpu_d.raw_buffer_store(value, ptr, indices=[offset])
+        
         return None
 
 
@@ -488,7 +651,6 @@ def _create_vec_read_write(
     has_int_strides = all(isinstance(s, int) for s in strides)
     if has_int_strides:
         strides = [gen_sympy_index(add_emitter_subs(emitter), s) for s in strides]
-
     # Linearize memref if buffer ops are enabled and strides are integers.
     data, offset_th = None, None
     if buffer_ops_enabled and has_int_strides:
