@@ -10,6 +10,7 @@ from ...ops.wave_ops import Iterate, IterArg, get_custom, CustomOp
 from .multi_buffering import multi_buffer
 from .modulo_scheduling import ModuloScheduler
 from .prefetch_scheduling import PrefetchScheduler
+from .gemm_four_stage_pipelined_scheduling import GemmFourStageScheduler
 from .graph_utils import create_scheduling_edges, Edge
 from .resources import (
     get_available_resources,
@@ -84,7 +85,7 @@ def schedule_reduction(
     graph, node_map = graph_copy(reduction_graph)
     ignore_nodes, iter_args, output = annotate_resource_usage(graph)
     edges = create_scheduling_edges(graph, ignore_nodes, iter_args, output)
-
+    
     update_sort_keys(trace, graph)
 
     if override_schedule_file:
@@ -107,6 +108,8 @@ def schedule_reduction(
             scheduler = ModuloScheduler(graph, edges, get_available_resources())
         elif scheduling_type == SchedulingType.PREFETCH:
             scheduler = PrefetchScheduler(graph, edges, get_available_resources())
+        elif scheduling_type == SchedulingType.GEMM_FOUR_STAGE:
+            scheduler = GemmFourStageScheduler(graph, edges, get_available_resources())
         else:
             raise ValueError("Unknown scheduling type")
 
@@ -211,12 +214,16 @@ def schedule_reduction(
         max_induction_variable,
         visualize,
         use_scheduling_barriers,
+        scheduling_type,
     )
 
     # Update new reduction count.
     new_reduction.count = max_induction_variable - (num_stages - 1)
-    if scheduling_type == SchedulingType.MODULO_MULTI_BUFFERED:
-        multi_buffer(trace)
+    if (
+        scheduling_type == SchedulingType.MODULO_MULTI_BUFFERED
+        or scheduling_type == SchedulingType.GEMM_FOUR_STAGE
+    ):
+        multi_buffer(trace, scheduling_type)
 
 
 def schedule_graph(
